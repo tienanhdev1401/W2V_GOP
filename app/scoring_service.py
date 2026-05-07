@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # pyright: reportMissingImports=false
 
+import json
 import re
 import tempfile
 import threading
@@ -43,6 +44,16 @@ def bell_curve_score_0_5(value: float, target: float, sigma: float) -> float:
     sigma_safe = max(float(sigma), 1e-3)
     z = (float(value) - float(target)) / sigma_safe
     return float(np.clip(5.0 * np.exp(-0.5 * z * z), 0.0, 5.0))
+
+
+def apply_isotonic_0_5(value: float, knots_x: np.ndarray, knots_y: np.ndarray) -> float:
+    """Piecewise-linear monotonic mapping using isotonic-regression knots.
+    Values outside the trained range are clipped to the boundary outputs.
+    """
+    if knots_x is None or knots_y is None or knots_x.size == 0:
+        return float(np.clip(value, 0.0, 5.0))
+    out = float(np.interp(float(value), knots_x, knots_y))
+    return float(np.clip(out, 0.0, 5.0))
 
 
 def score_band_0_5(score: float, weak_lt: float, good_gte: float) -> str:
@@ -113,8 +124,8 @@ class ScoreConfig:
     min_rms_energy: float = 0.003
     min_rms_db: float = -52.0
     feature_clip_value: float = 5.0
-    smoothing_utt_weight: float = 0.7
-    smoothing_word_weight: float = 0.3
+    smoothing_utt_weight: float = 0.5
+    smoothing_word_weight: float = 0.5
     phone_temperature: float = 0.75
     phone_temperature_center_0_2: float = 1.0
     speech_rate_target_phones_per_sec: float = 3.0
@@ -131,6 +142,9 @@ class ScoreConfig:
     band_good_gte_0_5: float = 4.0
     overall_fair_gte_0_5: float = 2.8
     overall_good_gte_0_5: float = 4.0
+    isotonic_calibration_path: Path = field(
+        default_factory=lambda: MODEL_ROOT / "iso_calibration.json"
+    )
     conversation_pronunciation_weight: float = 0.75
     conversation_grammar_weight: float = 0.25
     grammar_profile_version: str = "rule_v1.0.0"
@@ -157,6 +171,9 @@ class W2VGOPScoringService:
         self.norm_mean: Optional[np.ndarray] = None
         self.norm_std: Optional[np.ndarray] = None
         self.calibration_stats: Dict[str, Dict[str, float]] = {}
+        self.iso_knots_x: Optional[np.ndarray] = None
+        self.iso_knots_y: Optional[np.ndarray] = None
+        self.iso_metadata: Dict[str, Any] = {}
         self.model_version: str = "unknown"
         self.calibration_version: str = "unknown"
         self.preprocessing_profile: Dict[str, Any] = {}
@@ -270,7 +287,54 @@ class W2VGOPScoringService:
 
             self.blank_id = self.processor.tokenizer.pad_token_id
             self.unk_id = self.processor.tokenizer.unk_token_id
+
+            self._load_isotonic_calibration()
             self._ready = True
+
+    def _load_isotonic_calibration(self) -> None:
+        path = Path(self.config.isotonic_calibration_path).expanduser().resolve()
+        if not path.exists():
+            self.iso_knots_x = None
+            self.iso_knots_y = None
+            self.iso_metadata = {}
+            return
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            knots = data.get("knots", {}) or {}
+            xs = np.asarray(knots.get("x", []), dtype=np.float64)
+            ys = np.asarray(knots.get("y", []), dtype=np.float64)
+            if xs.size < 2 or ys.size != xs.size:
+                raise ValueError("isotonic knots invalid")
+            order = np.argsort(xs)
+            self.iso_knots_x = xs[order]
+            self.iso_knots_y = ys[order]
+            self.iso_metadata = {
+                "version": data.get("version", "iso"),
+                "trained_on": data.get("trained_on", ""),
+                "n_samples": int(data.get("n_samples", 0)),
+                "path": str(path),
+            }
+            self.calibration_version = (
+                f"isotonic:{self.iso_metadata['version']}:n={self.iso_metadata['n_samples']}"
+            )
+            bands = (data.get("recommended_bands") or {})
+            if "band_weak_lt_0_5" in bands and "band_good_gte_0_5" in bands:
+                weak = float(bands["band_weak_lt_0_5"])
+                good = float(bands["band_good_gte_0_5"])
+                self.config.band_weak_lt_0_5 = weak
+                self.config.band_good_gte_0_5 = good
+                self.config.overall_fair_gte_0_5 = weak
+                self.config.overall_good_gte_0_5 = good
+        except Exception:
+            self.iso_knots_x = None
+            self.iso_knots_y = None
+            self.iso_metadata = {}
+
+    def _calibrate_overall_0_5(self, value: float) -> float:
+        if self.iso_knots_x is None or self.iso_knots_y is None:
+            return float(np.clip(value, 0.0, 5.0))
+        return apply_isotonic_0_5(value, self.iso_knots_x, self.iso_knots_y)
 
     def _fit_stats_1d(self, values: np.ndarray) -> Tuple[float, float]:
         arr = np.asarray(values, dtype=np.float32)
@@ -1496,7 +1560,9 @@ class W2VGOPScoringService:
             word_w = float(self.config.smoothing_word_weight)
             w_sum = max(utt_w + word_w, 1e-8)
             final_smoothed = (utt_w * scores_0_5["utt_total"] + word_w * scores_0_5["word_total_mean"]) / w_sum
-            scores_0_5["final_smoothed"] = float(np.clip(final_smoothed, 0.0, 5.0))
+            final_smoothed_pre_iso = float(np.clip(final_smoothed, 0.0, 5.0))
+            scores_0_5["final_smoothed_pre_iso"] = final_smoothed_pre_iso
+            scores_0_5["final_smoothed"] = float(self._calibrate_overall_0_5(final_smoothed_pre_iso))
 
             overall_score_0_5 = float(scores_0_5["final_smoothed"])
             overall_score_0_100 = float(np.clip(overall_score_0_5 * 20.0, 0.0, 100.0))
